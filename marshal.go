@@ -58,6 +58,19 @@ type SnmpPacket struct {
 	Timestamp    int
 }
 
+type SnmpPacketV1 struct {
+	Version      SnmpVersion
+	Community    string
+	PDUType      PDUType
+	Enterprise   asn1.ObjectIdentifier
+	AgentAddr    string
+	GenericTrap  int
+	SpecificTrap int
+	Timestamp    int
+	Variables    []SnmpPDU
+	Logger       Logger
+}
+
 // VarBind struct represents an SNMP Varbind.
 type VarBind struct {
 	Name  asn1.ObjectIdentifier
@@ -106,6 +119,64 @@ func (x *GoSNMP) logPrintf(format string, v ...interface{}) {
 	if x.loggingEnabled {
 		x.Logger.Printf(format, v...)
 	}
+}
+
+func (x *GoSNMP) sendOneRequestV1(packetOut *SnmpPacketV1,
+	wait bool) (result *SnmpPacketV1, err error) {
+	finalDeadline := time.Now().Add(x.Timeout)
+
+	allReqIDs := make([]uint32, 0, x.Retries+1)
+	for retries := 0; ; retries++ {
+		if retries > 0 {
+			x.logPrintf("Retry number %d. Last error was: %v", retries, err)
+			if time.Now().After(finalDeadline) {
+				err = fmt.Errorf("Request timeout (after %d retries)", retries-1)
+				break
+			}
+			if retries > x.Retries {
+				// Report last error
+				break
+			}
+		}
+		err = nil
+
+		reqDeadline := time.Now().Add(x.Timeout / time.Duration(x.Retries+1))
+		x.Conn.SetDeadline(reqDeadline)
+
+		// Request ID is an atomic counter (started at a random value)
+		reqID := atomic.AddUint32(&(x.requestID), 1) // TODO: fix overflows
+		allReqIDs = append(allReqIDs, reqID)
+
+		x.logPrintf("PACKET SENT: %#+v", *packetOut)
+
+		var outBuf []byte
+		outBuf, err = packetOut.marshalMsg()
+		if err != nil {
+			// Don't retry - not going to get any better!
+			err = fmt.Errorf("marshal: %v", err)
+			break
+		}
+
+		_, err = x.Conn.Write(outBuf)
+		if err != nil {
+			continue
+		}
+
+		// all sends wait for the return packet, except for SNMPv2Trap
+		if wait == false {
+			return &SnmpPacketV1{}, nil
+		}
+
+		if err != nil {
+			continue
+		}
+
+		// Success!
+		return result, nil
+	}
+
+	// Return last error
+	return nil, err
 }
 
 // send/receive one snmp request
@@ -309,6 +380,32 @@ func (x *GoSNMP) send(packetOut *SnmpPacket, wait bool) (result *SnmpPacket, err
 	return result, err
 }
 
+func (x *GoSNMP) sendV1(packetOut *SnmpPacketV1, wait bool) (result *SnmpPacketV1, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("recover: %v", e)
+		}
+	}()
+
+	if x.Conn == nil {
+		return nil, fmt.Errorf("&GoSNMP.Conn is missing. Provide a connection or use Connect()")
+	}
+
+	if x.Retries < 0 {
+		x.Retries = 0
+	}
+	x.logPrint("SEND INIT")
+
+	// perform request
+	result, err = x.sendOneRequestV1(packetOut, wait)
+	if err != nil {
+		x.logPrintf("SEND Error on the first Request Error: %s", err)
+		return result, err
+	}
+
+	return result, err
+}
+
 // -- Marshalling Logic --------------------------------------------------------
 
 // marshal an SNMP message
@@ -353,6 +450,115 @@ func (packet *SnmpPacket) marshalMsg() ([]byte, error) {
 	}
 
 	return authenticatedMessage, nil
+}
+
+func (packet *SnmpPacketV1) marshalMsg() ([]byte, error) {
+	var err error
+	buf := new(bytes.Buffer)
+
+	// version
+	buf.Write([]byte{2, 1, byte(packet.Version)})
+
+	// community
+	buf.Write([]byte{4, uint8(len(packet.Community))})
+	buf.WriteString(packet.Community)
+	// pdu
+	pdu, err := packet.marshalPDU()
+	if err != nil {
+		return nil, err
+	}
+	buf.Write(pdu)
+
+	// build up resulting msg - sequence, length then the tail (buf)
+	msg := new(bytes.Buffer)
+	msg.WriteByte(byte(Sequence))
+
+	bufLengthBytes, err2 := marshalLength(buf.Len())
+	if err2 != nil {
+		return nil, err2
+	}
+	msg.Write(bufLengthBytes)
+	buf.WriteTo(msg) // reverse logic - want to do msg.Write(buf)
+
+	return msg.Bytes(), nil
+}
+
+func (packet *SnmpPacketV1) marshalPDU() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// build up resulting pdu - request type, length, then the tail (buf)
+	pdu := new(bytes.Buffer)
+	pdu.WriteByte(byte(packet.PDUType))
+
+	// write objectIdentifier type, length and objectIdentifier value
+	mOid, err := marshalObjectIdentifier(packet.Enterprise)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to marshal OID: %s\n", err.Error())
+	}
+
+	buf.Write([]byte{ObjectIdentifier, byte(len(mOid))})
+	buf.Write(mOid)
+
+	// write IPAddress type, length and ipAddress value
+	ip := net.ParseIP(packet.AgentAddr)
+	ipAddressBytes := ipv4toBytes(ip)
+	buf.Write([]byte{IPAddress, byte(len(ipAddressBytes))})
+	buf.Write(ipAddressBytes)
+
+	buf.Write([]byte{Integer, 1})
+	buf.WriteByte(byte(packet.GenericTrap))
+
+	buf.Write([]byte{Integer, 1})
+	buf.WriteByte(byte(packet.SpecificTrap))
+
+	timeTicks, e := marshalUint32(uint32(packet.Timestamp))
+	if e != nil {
+		return nil, fmt.Errorf("Unable to Timestamp: %s\n", e.Error())
+	}
+
+	buf.Write([]byte{TimeTicks, byte(len(timeTicks))})
+	buf.Write(timeTicks)
+
+	// varbind list
+	vbl, err := packet.marshalVBL()
+	if err != nil {
+		return nil, err
+	}
+	buf.Write(vbl)
+
+	bufLengthBytes, err2 := marshalLength(buf.Len())
+	if err2 != nil {
+		return nil, err2
+	}
+	pdu.Write(bufLengthBytes)
+
+	buf.WriteTo(pdu) // reverse logic - want to do pdu.Write(buf)
+	return pdu.Bytes(), nil
+}
+
+// marshal a varbind list
+func (packet *SnmpPacketV1) marshalVBL() ([]byte, error) {
+
+	vblBuf := new(bytes.Buffer)
+	for _, pdu := range packet.Variables {
+		vb, err := marshalVarbind(&pdu)
+		if err != nil {
+			return nil, err
+		}
+		vblBuf.Write(vb)
+	}
+
+	vblBytes := vblBuf.Bytes()
+	vblLengthBytes, err := marshalLength(len(vblBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	// FIX does bytes.Buffer give better performance than byte slices?
+	result := []byte{byte(Sequence)}
+	result = append(result, vblLengthBytes...)
+	result = append(result, vblBytes...)
+	return result, nil
 }
 
 // marshal a PDU
@@ -445,15 +651,15 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		pduBuf.Write(oid)
 		pduBuf.Write([]byte{Null, 0x00})
 
-	/*
-		NUMBERS:
+		/*
+			NUMBERS:
 
-		Integer32 and INTEGER:
-		-2^31 and 2^31-1 inclusive (-2147483648 to 2147483647 decimal)
+			Integer32 and INTEGER:
+			-2^31 and 2^31-1 inclusive (-2147483648 to 2147483647 decimal)
 
-		Counter32, Gauge32, TimeTicks, Unsigned32:
-		non-negative integer, maximum value of 2^32-1 (4294967295 decimal)
-	*/
+			Counter32, Gauge32, TimeTicks, Unsigned32:
+			non-negative integer, maximum value of 2^32-1 (4294967295 decimal)
+		*/
 
 	case Integer:
 		// TODO tests currently only cover positive integers
@@ -570,7 +776,7 @@ func marshalVarbind(pdu *SnmpPDU) ([]byte, error) {
 		pduBuf.Write(length)
 		pduBuf.Write(tmpBytes)
 
-	// MrSpock changes. TODO NO tests for this yet - waiting for .pcap
+		// MrSpock changes. TODO NO tests for this yet - waiting for .pcap
 	case IPAddress:
 		//Oid
 		tmpBuf.Write([]byte{byte(ObjectIdentifier), byte(len(oid))})
