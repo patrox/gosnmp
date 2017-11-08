@@ -60,7 +60,7 @@ func (x *GoSNMP) SendTrap(pdus []SnmpPDU) (result *SnmpPacket, err error) {
 	return x.send(packetOut, false)
 }
 
-func (x *GoSNMP) SendV1Trap(pdus []SnmpPDU, enterprise []int, agentAddress string, genericTrap int, specificTrap int, timestamp int) (result *SnmpPacketV1, err error) {
+func (x *GoSNMP) SendV1Trap(pdus []SnmpPDU, enterprise []int, agentAddress string, genericTrap int, specificTrap int, timestamp int) (result *SnmpPacket, err error) {
 	switch x.Version {
 		case Version2c, Version3:
 			err = fmt.Errorf("SendV1Trap doesn't support %s", x.Version)
@@ -73,9 +73,9 @@ func (x *GoSNMP) SendV1Trap(pdus []SnmpPDU, enterprise []int, agentAddress strin
 		return nil, fmt.Errorf("SendV1Trap requires at least 1 pdu")
 	}
 
-	packetOut := x.mkSnmpPacketV1(Trap, enterprise, agentAddress, genericTrap, specificTrap, timestamp, pdus)
+	packetOut := x.mkSnmpPacketV1Trap(Trap, enterprise, agentAddress, genericTrap, specificTrap, timestamp, pdus)
 
-	return x.sendV1(packetOut, false)
+	return x.send(packetOut, false)
 }
 
 
