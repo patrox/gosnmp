@@ -115,7 +115,6 @@ var Default = &GoSNMP{
 
 // SnmpPDU will be used when doing SNMP Set's
 type SnmpPDU struct {
-
 	// Name is an oid in string format eg ".1.3.6.1.4.9.27"
 	Name string
 
@@ -248,6 +247,20 @@ func (x *GoSNMP) validateParameters() error {
 	}
 
 	return nil
+}
+
+func (x *GoSNMP) mkSnmpPacketV1Trap(pdutype PDUType, enterprise []int, agentAddress string, genericTrap int, specificTrap int, timestamp int, pdus []SnmpPDU) *SnmpPacket {
+	return &SnmpPacket{
+		Version:      x.Version,
+		Community:    x.Community,
+		PDUType:      pdutype,
+		Enterprise:   enterprise,
+		AgentAddr:    agentAddress,
+		GenericTrap:  genericTrap,
+		SpecificTrap: specificTrap,
+		Timestamp:    timestamp,
+		Variables:    pdus,
+	}
 }
 
 func (x *GoSNMP) mkSnmpPacket(pdutype PDUType, pdus []SnmpPDU, nonRepeaters uint8, maxRepetitions uint8) *SnmpPacket {

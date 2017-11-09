@@ -359,11 +359,13 @@ func (packet *SnmpPacket) marshalMsg() ([]byte, error) {
 func (packet *SnmpPacket) marshalPDU() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	// requestid
-	buf.Write([]byte{2, 4})
-	err := binary.Write(buf, binary.BigEndian, packet.RequestID)
-	if err != nil {
-		return nil, err
+	if packet.PDUType != Trap {
+		// requestid
+		buf.Write([]byte{2, 4})
+		err := binary.Write(buf, binary.BigEndian, packet.RequestID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if packet.PDUType == GetBulkRequest {
@@ -372,6 +374,37 @@ func (packet *SnmpPacket) marshalPDU() ([]byte, error) {
 
 		// max repetitions
 		buf.Write([]byte{2, 1, packet.MaxRepetitions})
+	} else if packet.PDUType == Trap {
+
+		// write objectIdentifier type, length and objectIdentifier value
+		mOid, err := marshalObjectIdentifier(packet.Enterprise)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to marshal OID: %s\n", err.Error())
+		}
+
+		buf.Write([]byte{ObjectIdentifier, byte(len(mOid))})
+		buf.Write(mOid)
+
+		// write IPAddress type, length and ipAddress value
+		ip := net.ParseIP(packet.AgentAddr)
+		ipAddressBytes := ipv4toBytes(ip)
+		buf.Write([]byte{IPAddress, byte(len(ipAddressBytes))})
+		buf.Write(ipAddressBytes)
+
+		buf.Write([]byte{Integer, 1})
+		buf.WriteByte(byte(packet.GenericTrap))
+
+		buf.Write([]byte{Integer, 1})
+		buf.WriteByte(byte(packet.SpecificTrap))
+
+		timeTicks, e := marshalUint32(uint32(packet.Timestamp))
+		if e != nil {
+			return nil, fmt.Errorf("Unable to Timestamp: %s\n", e.Error())
+		}
+
+		buf.Write([]byte{TimeTicks, byte(len(timeTicks))})
+		buf.Write(timeTicks)
+
 	} else { // get and getnext have same packet format
 
 		// error
